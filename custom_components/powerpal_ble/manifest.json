@@ -1,18 +1,33 @@
 {
   "domain": "powerpal_ble",
   "name": "Powerpal BLE",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "config_flow": true,
   "documentation": "https://github.com/WeekendWarrior1/powerpal_ble",
   "issue_tracker": "https://github.com/WeekendWarrior1/powerpal_ble/issues",
   "codeowners": [],
-  "dependencies": ["bluetooth", "bluetooth_adapters"],
+  "dependencies": [
+    "bluetooth",
+    "bluetooth_adapters"
+  ],
   "requirements": [],
   "iot_class": "local_push",
   "integration_type": "device",
   "bluetooth": [
     {
       "service_uuid": "59daabcd-12f4-25a6-7d4f-55961dce4205",
+      "connectable": true
+    },
+    {
+      "local_name": "Powerpal*",
+      "connectable": true
+    },
+    {
+      "local_name": "POWERPAL*",
+      "connectable": true
+    },
+    {
+      "local_name": "powerpal*",
       "connectable": true
     }
   ]

@@ -2,11 +2,37 @@
   "config": {
     "step": {
       "user": {
+        "title": "Select Powerpal BLE device",
+        "description": "Select a detected {scan_type} device, then enter the pairing details. If the Powerpal app is connected, turn off Bluetooth on that phone or close the app while setting this up. If your Powerpal is not listed, choose manual entry.",
+        "data": {
+          "address": "Detected Bluetooth device",
+          "name": "Name",
+          "pairing_code": "Powerpal pairing code",
+          "pulses_per_kwh": "Meter pulses per kWh",
+          "notification_interval": "Notification interval in minutes",
+          "drop_stale_measurements": "Drop stale/catch-up measurements",
+          "stale_measurement_seconds": "Stale measurement limit in seconds"
+        }
+      },
+      "setup": {
         "title": "Powerpal BLE",
-        "description": "Connect Home Assistant directly to a Powerpal over Bluetooth LE. Turn off the Powerpal mobile app/Bluetooth connection while setting this up.",
+        "description": "Connect Home Assistant directly to a Powerpal over Bluetooth LE. Turn off the Powerpal mobile app/Bluetooth connection while setting this up. If the address was discovered, it has been pre-filled below.",
         "data": {
           "name": "Name",
           "address": "Powerpal BLE MAC address",
+          "pairing_code": "Powerpal pairing code",
+          "pulses_per_kwh": "Meter pulses per kWh",
+          "notification_interval": "Notification interval in minutes",
+          "drop_stale_measurements": "Drop stale/catch-up measurements",
+          "stale_measurement_seconds": "Stale measurement limit in seconds"
+        }
+      },
+      "manual": {
+        "title": "Powerpal BLE manual setup",
+        "description": "Enter the Powerpal Bluetooth MAC address and pairing details. Turn off the Powerpal mobile app/Bluetooth connection while setting this up.",
+        "data": {
+          "address": "Powerpal BLE MAC address",
+          "name": "Name",
           "pairing_code": "Powerpal pairing code",
           "pulses_per_kwh": "Meter pulses per kWh",
           "notification_interval": "Notification interval in minutes",
@@ -20,7 +46,9 @@
       "invalid_pairing_code": "Use the numeric pairing code printed in your Powerpal pack or shown in the Powerpal app."
     },
     "abort": {
-      "already_configured": "This Powerpal is already configured."
+      "already_configured": "This Powerpal is already configured.",
+      "not_connectable": "This Powerpal was only seen by a non-connectable Bluetooth adapter/proxy.",
+      "not_supported": "This Bluetooth device does not look like a supported Powerpal."
     }
   },
   "options": {
