@@ -1,0 +1,59 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Powerpal BLE",
+        "description": "Connect Home Assistant directly to a Powerpal over Bluetooth LE. Turn off the Powerpal mobile app/Bluetooth connection while setting this up.",
+        "data": {
+          "name": "Name",
+          "address": "Powerpal BLE MAC address",
+          "pairing_code": "Powerpal pairing code",
+          "pulses_per_kwh": "Meter pulses per kWh",
+          "notification_interval": "Notification interval in minutes",
+          "drop_stale_measurements": "Drop stale/catch-up measurements",
+          "stale_measurement_seconds": "Stale measurement limit in seconds"
+        }
+      }
+    },
+    "error": {
+      "invalid_address": "Use a Bluetooth MAC address like AA:BB:CC:DD:EE:FF.",
+      "invalid_pairing_code": "Use the numeric pairing code printed in your Powerpal pack or shown in the Powerpal app."
+    },
+    "abort": {
+      "already_configured": "This Powerpal is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Powerpal BLE options",
+        "description": "Changing options reloads the integration and reconnects to the Powerpal.",
+        "data": {
+          "name": "Name",
+          "address": "Powerpal BLE MAC address",
+          "pairing_code": "Powerpal pairing code",
+          "pulses_per_kwh": "Meter pulses per kWh",
+          "notification_interval": "Notification interval in minutes",
+          "drop_stale_measurements": "Drop stale/catch-up measurements",
+          "stale_measurement_seconds": "Stale measurement limit in seconds"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "power": {
+        "name": "Power"
+      },
+      "total_energy": {
+        "name": "Total energy"
+      },
+      "daily_energy": {
+        "name": "Daily energy"
+      },
+      "battery": {
+        "name": "Battery"
+      }
+    }
+  }
+}
