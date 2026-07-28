@@ -50,7 +50,8 @@ SERVICE_DISCOVERY_POLL = 0.5
 
 # BLE calls can block forever, which would wedge the reconnect loop silently.
 CONNECT_TIMEOUT = 120.0
-SETUP_TIMEOUT = 60.0
+# Wide enough for the worst case of bonding plus both pairing-code write attempts.
+SETUP_TIMEOUT = 90.0
 NOTIFY_TIMEOUT = 20.0
 
 # The device stalls the measurement CCCD write if it is issued straight after a
@@ -64,23 +65,10 @@ BATTERY_FIRST_READ_DELAY = 15.0
 BATTERY_RETRY_DELAYS = (30.0, 60.0, 300.0, 900.0)
 BATTERY_REFRESH_INTERVAL = 3600.0
 
-# Errors that mean the peripheral wants OS-level bonding before it will accept a write.
-AUTH_ERROR_MARKERS = (
-    "insufficient authentication",
-    "insufficient encryption",
-    "not authorized",
-    "notauthorized",
-    "not permitted",
-    "notpermitted",
-    "not paired",
-    "authentication",
-)
-
-
-def _is_auth_error(err: Exception) -> bool:
-    """Return True if a GATT error indicates the device wants OS-level bonding."""
-    message = str(err).lower()
-    return any(marker in message for marker in AUTH_ERROR_MARKERS)
+# Bail out before the 30s ATT transaction timeout: once that fires the stack is
+# obliged to close the ATT bearer, which takes the whole connection down with it.
+PAIRING_WRITE_TIMEOUT = 15.0
+BOND_TIMEOUT = 20.0
 
 
 @dataclass(frozen=True)
@@ -504,46 +492,100 @@ class PowerpalRuntime:
         has been accepted. Its value is returned so the caller can skip a redundant
         reconfiguration write.
 
-        The write must be a Write Request. A Write Command carries no ATT response,
-        so a rejected pairing code looks identical to an accepted one and the
-        bonding fallback below can never be reached.
+        Bonding must happen before any of this. Powerpal asks for BLE security on
+        connect and simply does not answer GATT on an unencrypted link: the write
+        gets no ATT response at all, and after 30 seconds the spec obliges the stack
+        to close the ATT bearer and drop the connection. The reference firmware
+        driver has the same ordering, writing the pairing code only once OS-level
+        authentication has completed.
         """
+        await self._ensure_bonded(client)
+
+        # Bonding rebuilds the ATT link on BlueZ, which invalidates service discovery
+        # and can leave this client attached to a link that no longer exists.
+        if not client.is_connected:
+            raise BleakError(
+                f"Powerpal {self.address} dropped the link while bonding; the bond is "
+                "stored now, so the next attempt should connect encrypted"
+            )
+        await self._ensure_services_resolved(client)
+
         try:
-            return await self._try_authenticate(client)
+            return await self._try_authenticate(client, response=True)
         except Exception as err:  # noqa: BLE001 - backend specific error types
             first_error = err
             _LOGGER.debug(
-                "Powerpal %s did not accept the pairing code without bonding%s: %s",
+                "Powerpal %s did not answer a write request for pairing code %s: %s",
                 self.address,
-                " (device wants OS-level bonding)" if _is_auth_error(err) else "",
+                self.pairing_code,
                 err,
             )
 
-        # Powerpal requests BLE security on connect, so bond and try once more.
-        # Bonding is not done up front because on BlueZ it tears down and rebuilds
-        # the ATT link, invalidating service discovery.
-        if not await self._async_pair(client):
+        # Some firmware only accepts the pairing code as a Write Command. That gives
+        # no ATT response, so the batch-size read is what actually confirms it.
+        if not client.is_connected:
             raise BleakError(
-                f"Powerpal {self.address} did not accept the pairing code and "
-                f"OS-level bonding is unavailable here: {first_error}"
+                f"Powerpal {self.address} dropped the link during authentication "
+                f"({first_error})"
             )
 
-        # Pairing commonly resets the link, so re-check discovery before retrying.
-        await self._ensure_services_resolved(client)
         try:
-            return await self._try_authenticate(client)
+            return await self._try_authenticate(client, response=False)
         except Exception as err:  # noqa: BLE001 - backend specific error types
             raise BleakError(
-                f"Powerpal {self.address} rejected the pairing code even after "
-                f"bonding ({err}); check the 6-digit code shown in the Powerpal app"
+                f"Powerpal {self.address} rejected pairing code {self.pairing_code} "
+                f"({err}); check the 6-digit code shown in the Powerpal app, and that "
+                "the phone app is not holding the only connection slot"
             ) from err
 
-    async def _try_authenticate(self, client: BleakClient) -> int | None:
+    async def _ensure_bonded(self, client: BleakClient) -> None:
+        """Bond with the device unless the adapter already holds a bond.
+
+        Failure is not fatal: some backends and remote proxies cannot bond at all,
+        and the authentication attempt below is a better test than guessing here.
+        """
+        pair = getattr(client, "pair", None)
+        if pair is None:
+            _LOGGER.debug(
+                "Powerpal %s: backend cannot bond, trying the pairing code unencrypted",
+                self.address,
+            )
+            return
+
+        try:
+            try:
+                await asyncio.wait_for(pair(), timeout=BOND_TIMEOUT)
+            except TypeError:
+                # Older Bleak signatures require an explicit protection level.
+                await asyncio.wait_for(pair(2), timeout=BOND_TIMEOUT)
+            _LOGGER.debug("Powerpal %s: link bonded", self.address)
+        except Exception as err:  # noqa: BLE001 - backend specific error types
+            if "already" in str(err).lower():
+                _LOGGER.debug("Powerpal %s: already bonded", self.address)
+                return
+            _LOGGER.debug(
+                "Powerpal %s: bonding failed (%s); trying the pairing code anyway",
+                self.address,
+                err,
+            )
+
+    async def _try_authenticate(
+        self, client: BleakClient, *, response: bool
+    ) -> int | None:
         """Write the pairing code and read back a gated characteristic."""
-        await client.write_gatt_char(
-            PAIRING_CODE_UUID, self._pairing_code_bytes(), response=True
+        _LOGGER.debug(
+            "Powerpal %s: writing pairing code %s as %s (%s)",
+            self.address,
+            self.pairing_code,
+            "write request" if response else "write command",
+            self._pairing_code_bytes().hex(),
         )
-        _LOGGER.debug("Powerpal %s: pairing code accepted", self.address)
+        await asyncio.wait_for(
+            client.write_gatt_char(
+                PAIRING_CODE_UUID, self._pairing_code_bytes(), response=response
+            ),
+            timeout=PAIRING_WRITE_TIMEOUT,
+        )
         return await self._read_batch_size(client)
 
     async def _read_batch_size(self, client: BleakClient) -> int | None:
@@ -589,26 +631,6 @@ class PowerpalRuntime:
         )
         # The device needs a moment before it will answer the measurement CCCD write.
         await asyncio.sleep(SUBSCRIBE_SETTLE_DELAY)
-
-    async def _async_pair(self, client: BleakClient) -> bool:
-        """Attempt OS-level BLE bonding. Return True if it appears to have worked."""
-        pair = getattr(client, "pair", None)
-        if pair is None:
-            return False
-
-        _LOGGER.info("Attempting OS-level pairing with Powerpal %s", self.address)
-        try:
-            await pair()
-            return True
-        except TypeError:
-            try:
-                await pair(2)
-                return True
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Bleak pair(2) failed: %s", err)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Bleak pairing failed or is unsupported: %s", err)
-        return False
 
     def _pairing_code_bytes(self) -> bytes:
         """Return the Powerpal pairing code as a little-endian uint32."""
