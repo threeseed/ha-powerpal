@@ -48,6 +48,10 @@ Listener = Callable[[], None]
 SERVICE_DISCOVERY_TIMEOUT = 20.0
 SERVICE_DISCOVERY_POLL = 0.5
 
+# BLE calls can block forever, which would wedge the reconnect loop silently.
+CONNECT_TIMEOUT = 120.0
+SETUP_TIMEOUT = 60.0
+
 # Errors that mean the peripheral wants OS-level bonding before it will accept a write.
 AUTH_ERROR_MARKERS = (
     "insufficient authentication",
@@ -279,23 +283,32 @@ class PowerpalRuntime:
             self.address,
             getattr(ble_device, "name", None) or "unnamed",
         )
-        client = await self._establish_client(ble_device)
+        try:
+            client = await asyncio.wait_for(
+                self._establish_client(ble_device), timeout=CONNECT_TIMEOUT
+            )
+        except (asyncio.TimeoutError, TimeoutError) as err:
+            raise RuntimeError(
+                f"Timed out after {CONNECT_TIMEOUT:.0f}s opening a BLE connection to "
+                f"Powerpal {self.address}"
+            ) from err
+
         self._client = client
         self._mark_connected()
+        _LOGGER.warning(
+            "BLE link established to Powerpal %s; starting GATT setup", self.address
+        )
 
         try:
-            await self._ensure_services_resolved(client)
-            await self._write_pairing_code(client)
-            await asyncio.sleep(0.5)
-            await client.write_gatt_char(
-                READING_BATCH_SIZE_UUID,
-                int(self.notification_interval).to_bytes(4, byteorder="little"),
-                response=False,
-            )
-
-            await self._read_battery(client)
-            await self._start_battery_notifications(client)
-            await client.start_notify(MEASUREMENT_UUID, self._notification_callback)
+            try:
+                await asyncio.wait_for(
+                    self._async_setup_session(client), timeout=SETUP_TIMEOUT
+                )
+            except (asyncio.TimeoutError, TimeoutError) as err:
+                raise RuntimeError(
+                    f"Timed out after {SETUP_TIMEOUT:.0f}s during GATT setup for "
+                    f"Powerpal {self.address}"
+                ) from err
 
             _LOGGER.info(
                 "Connected to Powerpal %s; waiting for %s-minute measurements",
@@ -308,6 +321,33 @@ class PowerpalRuntime:
             await self._safe_disconnect(client)
             self._client = None
             self._mark_disconnected(None)
+
+    async def _async_setup_session(self, client: BleakClient) -> None:
+        """Authenticate and subscribe on a freshly connected client.
+
+        Each step is logged so a stalled GATT call can be identified; the caller
+        bounds the whole sequence with a timeout.
+        """
+        await self._ensure_services_resolved(client)
+        _LOGGER.warning("Powerpal %s: services resolved", self.address)
+
+        await self._write_pairing_code(client)
+        _LOGGER.warning("Powerpal %s: pairing code written", self.address)
+
+        await asyncio.sleep(0.5)
+        await client.write_gatt_char(
+            READING_BATCH_SIZE_UUID,
+            int(self.notification_interval).to_bytes(4, byteorder="little"),
+            response=False,
+        )
+        _LOGGER.warning("Powerpal %s: reading batch size written", self.address)
+
+        await self._read_battery(client)
+        await self._start_battery_notifications(client)
+        _LOGGER.warning("Powerpal %s: battery handled", self.address)
+
+        await client.start_notify(MEASUREMENT_UUID, self._notification_callback)
+        _LOGGER.warning("Powerpal %s: subscribed to measurements", self.address)
 
     def _unreachable_message(self) -> str:
         """Explain why no connectable BLEDevice is available for this address.
