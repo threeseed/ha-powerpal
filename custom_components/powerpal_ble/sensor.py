@@ -152,8 +152,13 @@ class PowerpalSensor(SensorEntity, RestoreEntity):
 
     @property
     def available(self) -> bool:
-        """Return whether the entity is available."""
-        return self.runtime.available and self.native_value is not None
+        """Return whether the entity is available.
+
+        Availability tracks the BLE link only. Powerpal pushes measurements on its
+        notification interval, so a value of None just means nothing has arrived
+        yet; that is reported as an unknown state rather than an unavailable one.
+        """
+        return self.runtime.available
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

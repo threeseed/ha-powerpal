@@ -178,7 +178,7 @@ class PowerpalRuntime:
 
         self._stop_event = asyncio.Event()
         self._task = self._async_create_connection_task()
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Started Powerpal BLE connection loop for %s (%s connectable scanner(s))",
             self.address,
             scanner_count,
@@ -279,7 +279,7 @@ class PowerpalRuntime:
         if ble_device is None:
             raise RuntimeError(self._unreachable_message())
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Opening BLE connection to Powerpal %s (%s)",
             self.address,
             getattr(ble_device, "name", None) or "unnamed",
@@ -296,7 +296,7 @@ class PowerpalRuntime:
 
         self._client = client
         self._mark_connected()
-        _LOGGER.warning(
+        _LOGGER.debug(
             "BLE link established to Powerpal %s; starting GATT setup", self.address
         )
 
@@ -330,10 +330,10 @@ class PowerpalRuntime:
         bounds the whole sequence with a timeout.
         """
         await self._ensure_services_resolved(client)
-        _LOGGER.warning("Powerpal %s: services resolved", self.address)
+        _LOGGER.debug("Powerpal %s: services resolved", self.address)
 
         await self._write_pairing_code(client)
-        _LOGGER.warning("Powerpal %s: pairing code written", self.address)
+        _LOGGER.debug("Powerpal %s: pairing code written", self.address)
 
         await asyncio.sleep(0.5)
         await client.write_gatt_char(
@@ -341,14 +341,14 @@ class PowerpalRuntime:
             int(self.notification_interval).to_bytes(4, byteorder="little"),
             response=False,
         )
-        _LOGGER.warning("Powerpal %s: reading batch size written", self.address)
+        _LOGGER.debug("Powerpal %s: reading batch size written", self.address)
 
         await self._read_battery(client)
         await self._start_battery_notifications(client)
-        _LOGGER.warning("Powerpal %s: battery handled", self.address)
+        _LOGGER.debug("Powerpal %s: battery handled", self.address)
 
         await self._subscribe_to_measurements(client)
-        _LOGGER.warning("Powerpal %s: subscribed to measurements", self.address)
+        _LOGGER.debug("Powerpal %s: subscribed to measurements", self.address)
 
     async def _subscribe_to_measurements(self, client: BleakClient) -> None:
         """Enable measurement notifications, bounded and with diagnostics.
@@ -364,7 +364,7 @@ class PowerpalRuntime:
         except Exception as err:  # noqa: BLE001 - diagnostics only
             _LOGGER.debug("Could not inspect measurement characteristic: %s", err)
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Powerpal %s: subscribing to measurements (connected=%s, properties=%s)",
             self.address,
             client.is_connected,
