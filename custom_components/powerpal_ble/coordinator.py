@@ -346,14 +346,14 @@ class PowerpalRuntime:
         )
         _LOGGER.debug("Powerpal %s: reading batch size written", self.address)
 
-        # Measurements are the reason this integration exists, so subscribe before
-        # touching the optional battery characteristic.
+        # Order matters: subscribing immediately after the batch-size write makes the
+        # device stall the CCCD write. The battery steps double as settle time.
+        await self._read_battery(client)
+        await self._start_battery_notifications(client)
+        _LOGGER.debug("Powerpal %s: battery handled", self.address)
+
         await self._subscribe_to_measurements(client)
         _LOGGER.debug("Powerpal %s: subscribed to measurements", self.address)
-
-        await self._start_battery_notifications(client)
-        await self._read_battery(client)
-        _LOGGER.debug("Powerpal %s: battery handled", self.address)
 
     async def _subscribe_to_measurements(self, client: BleakClient) -> None:
         """Enable measurement notifications, bounded and with diagnostics.
