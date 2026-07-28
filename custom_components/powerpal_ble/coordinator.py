@@ -53,6 +53,9 @@ CONNECT_TIMEOUT = 120.0
 SETUP_TIMEOUT = 60.0
 NOTIFY_TIMEOUT = 20.0
 
+BATTERY_READ_ATTEMPTS = 3
+BATTERY_READ_RETRY_DELAY = 2.0
+
 # Errors that mean the peripheral wants OS-level bonding before it will accept a write.
 AUTH_ERROR_MARKERS = (
     "insufficient authentication",
@@ -343,12 +346,14 @@ class PowerpalRuntime:
         )
         _LOGGER.debug("Powerpal %s: reading batch size written", self.address)
 
-        await self._read_battery(client)
-        await self._start_battery_notifications(client)
-        _LOGGER.debug("Powerpal %s: battery handled", self.address)
-
+        # Measurements are the reason this integration exists, so subscribe before
+        # touching the optional battery characteristic.
         await self._subscribe_to_measurements(client)
         _LOGGER.debug("Powerpal %s: subscribed to measurements", self.address)
+
+        await self._start_battery_notifications(client)
+        await self._read_battery(client)
+        _LOGGER.debug("Powerpal %s: battery handled", self.address)
 
     async def _subscribe_to_measurements(self, client: BleakClient) -> None:
         """Enable measurement notifications, bounded and with diagnostics.
@@ -539,13 +544,35 @@ class PowerpalRuntime:
         return int(self.pairing_code).to_bytes(4, byteorder="little")
 
     async def _read_battery(self, client: BleakClient) -> None:
-        """Read battery level if available."""
-        try:
-            battery = bytes(await client.read_gatt_char(BATTERY_UUID))
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Could not read Powerpal battery level: %s", err)
+        """Read battery level if available.
+
+        Powerpal often answers the first read with a generic ATT error while it is
+        still busy with the pairing/batch-size writes, so retry a few times. The
+        battery is optional: failing here must never abort the session, and
+        notifications can still deliver a value later.
+        """
+        for attempt in range(1, BATTERY_READ_ATTEMPTS + 1):
+            if not client.is_connected:
+                return
+            try:
+                battery = bytes(await client.read_gatt_char(BATTERY_UUID))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Could not read Powerpal battery level (attempt %s/%s): %s",
+                    attempt,
+                    BATTERY_READ_ATTEMPTS,
+                    err,
+                )
+                if attempt < BATTERY_READ_ATTEMPTS:
+                    await asyncio.sleep(BATTERY_READ_RETRY_DELAY)
+                continue
+            self._process_battery(battery)
             return
-        self._process_battery(battery)
+
+        _LOGGER.debug(
+            "Giving up on the Powerpal %s battery read; relying on notifications",
+            self.address,
+        )
 
     async def _start_battery_notifications(self, client: BleakClient) -> None:
         """Subscribe to battery notifications if available."""
