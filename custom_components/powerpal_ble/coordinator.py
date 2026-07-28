@@ -48,6 +48,14 @@ Listener = Callable[[], None]
 SERVICE_DISCOVERY_TIMEOUT = 20.0
 SERVICE_DISCOVERY_POLL = 0.5
 
+# Without these the session cannot authenticate or receive anything, so their
+# presence is what "discovery finished" actually has to mean.
+REQUIRED_CHARACTERISTICS = (
+    PAIRING_CODE_UUID,
+    READING_BATCH_SIZE_UUID,
+    MEASUREMENT_UUID,
+)
+
 # BLE calls can block forever, which would wedge the reconnect loop silently.
 CONNECT_TIMEOUT = 120.0
 SETUP_TIMEOUT = 60.0
@@ -367,7 +375,13 @@ class PowerpalRuntime:
             return
 
         try:
-            for service in client.services:
+            services = list(client.services)
+            _LOGGER.debug(
+                "Powerpal %s: GATT profile has %s service(s)",
+                self.address,
+                len(services),
+            )
+            for service in services:
                 _LOGGER.debug(
                     "Powerpal %s service %s", self.address, service.uuid
                 )
@@ -479,15 +493,40 @@ class PowerpalRuntime:
         await client.connect()
         return client
 
-    async def _ensure_services_resolved(self, client: BleakClient) -> None:
-        """Wait until GATT service discovery has completed on this connection.
+    def _missing_characteristics(self, client: BleakClient) -> list[str]:
+        """Return the characteristics this integration needs that are not present."""
+        try:
+            services = client.services
+        except BleakError:
+            # Bleak raises rather than returning an empty collection when discovery
+            # has not run yet, which means everything is still missing.
+            return list(REQUIRED_CHARACTERISTICS)
 
-        Bleak raises "Service Discovery has not been performed yet" from any GATT
-        call made before services are resolved, which happens on BlueZ whenever the
-        link is re-established underneath us (for example by a pairing attempt).
+        if services is None:
+            return list(REQUIRED_CHARACTERISTICS)
+
+        missing: list[str] = []
+        for uuid in REQUIRED_CHARACTERISTICS:
+            try:
+                found = services.get_characteristic(uuid)
+            except Exception:  # noqa: BLE001 - bleak version dependent
+                found = None
+            if found is None:
+                missing.append(uuid)
+        return missing
+
+    async def _ensure_services_resolved(self, client: BleakClient) -> None:
+        """Wait until the characteristics this integration needs are discovered.
+
+        Testing `client.services` for truthiness is not enough: the collection is a
+        plain object, so an *empty* profile passes that check. BlueZ hands back an
+        empty or partial profile often enough -- a stale GATT cache, or a link
+        rebuilt underneath us -- that the only reliable test is looking for the
+        characteristics themselves.
         """
         deadline = time.monotonic() + SERVICE_DISCOVERY_TIMEOUT
         last_error: Exception | None = None
+        cache_cleared = False
 
         while True:
             if not client.is_connected:
@@ -495,24 +534,43 @@ class PowerpalRuntime:
                     f"Powerpal {self.address} disconnected before service discovery finished"
                 )
 
-            try:
-                if client.services:
-                    return
-            except BleakError as err:
-                # Not resolved yet; fall through to an explicit discovery attempt.
-                last_error = err
+            missing = self._missing_characteristics(client)
+            if not missing:
+                return
 
+            if not cache_cleared and time.monotonic() >= deadline - (
+                SERVICE_DISCOVERY_TIMEOUT / 2
+            ):
+                # A stale BlueZ GATT cache survives reconnects and will keep serving
+                # the same incomplete profile, so drop it once and rediscover.
+                cache_cleared = True
+                clear_cache = getattr(client, "clear_cache", None)
+                if clear_cache is not None:
+                    _LOGGER.debug(
+                        "Powerpal %s: profile still missing %s, clearing the GATT cache",
+                        self.address,
+                        missing,
+                    )
+                    try:
+                        await clear_cache()
+                    except Exception as err:  # noqa: BLE001 - backend dependent
+                        _LOGGER.debug("Could not clear the GATT cache: %s", err)
+
+            # Trigger discovery, then loop back and re-check: the return value has
+            # the same problem as client.services and is truthy when empty.
             get_services = getattr(client, "get_services", None)
             if get_services is not None:
                 try:
-                    if await get_services():
-                        return
+                    await get_services()
                 except Exception as err:  # noqa: BLE001 - bleak version dependent
                     last_error = err
 
             if time.monotonic() >= deadline:
                 raise BleakError(
-                    f"Service discovery did not complete for Powerpal {self.address}: {last_error}"
+                    f"Powerpal {self.address} did not expose {', '.join(missing)} "
+                    f"within {SERVICE_DISCOVERY_TIMEOUT:.0f}s (last error: "
+                    f"{last_error}). If this persists, clear the adapter's cached "
+                    f"profile with 'bluetoothctl remove {self.address}'"
                 )
             await asyncio.sleep(SERVICE_DISCOVERY_POLL)
 
