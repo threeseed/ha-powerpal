@@ -439,20 +439,24 @@ class PowerpalRuntime:
             _LOGGER.debug("Could not subscribe to Powerpal battery notifications: %s", err)
 
     async def _safe_disconnect(self, client: BleakClient) -> None:
-        """Stop notifications and disconnect safely."""
-        if not client.is_connected:
-            return
+        """Stop notifications and disconnect safely.
 
-        for uuid in (MEASUREMENT_UUID, BATTERY_UUID):
-            try:
-                await client.stop_notify(uuid)
-            except Exception:  # noqa: BLE001
-                pass
+        disconnect() is always called, even when Bleak already believes the client
+        is gone: the Bluetooth manager only releases the adapter/proxy connection
+        slot when the client disconnects, so skipping it leaks a slot every time a
+        link drops mid-setup.
+        """
+        if client.is_connected:
+            for uuid in (MEASUREMENT_UUID, BATTERY_UUID):
+                try:
+                    await client.stop_notify(uuid)
+                except Exception:  # noqa: BLE001
+                    pass
 
         try:
             await client.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Powerpal %s disconnect failed: %s", self.address, err)
 
     def _notification_callback(self, _sender: Any, data: bytearray) -> None:
         """Handle measurement notifications from Bleak."""
