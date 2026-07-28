@@ -45,6 +45,27 @@ _LOGGER = logging.getLogger(__name__)
 
 Listener = Callable[[], None]
 
+SERVICE_DISCOVERY_TIMEOUT = 20.0
+SERVICE_DISCOVERY_POLL = 0.5
+
+# Errors that mean the peripheral wants OS-level bonding before it will accept a write.
+AUTH_ERROR_MARKERS = (
+    "insufficient authentication",
+    "insufficient encryption",
+    "not authorized",
+    "notauthorized",
+    "not permitted",
+    "notpermitted",
+    "not paired",
+    "authentication",
+)
+
+
+def _is_auth_error(err: Exception) -> bool:
+    """Return True if a GATT error indicates the device wants OS-level bonding."""
+    message = str(err).lower()
+    return any(marker in message for marker in AUTH_ERROR_MARKERS)
+
 
 @dataclass(frozen=True)
 class PowerpalData:
@@ -234,10 +255,8 @@ class PowerpalRuntime:
         self._mark_connected()
 
         try:
-            await self._pair_if_supported(client)
-            await client.write_gatt_char(
-                PAIRING_CODE_UUID, self._pairing_code_bytes(), response=False
-            )
+            await self._ensure_services_resolved(client)
+            await self._write_pairing_code(client)
             await asyncio.sleep(0.5)
             await client.write_gatt_char(
                 READING_BATCH_SIZE_UUID,
@@ -289,21 +308,94 @@ class PowerpalRuntime:
         await client.connect()
         return client
 
-    async def _pair_if_supported(self, client: BleakClient) -> None:
-        """Attempt OS-level BLE pairing where Bleak supports it."""
+    async def _ensure_services_resolved(self, client: BleakClient) -> None:
+        """Wait until GATT service discovery has completed on this connection.
+
+        Bleak raises "Service Discovery has not been performed yet" from any GATT
+        call made before services are resolved, which happens on BlueZ whenever the
+        link is re-established underneath us (for example by a pairing attempt).
+        """
+        deadline = time.monotonic() + SERVICE_DISCOVERY_TIMEOUT
+        last_error: Exception | None = None
+
+        while True:
+            if not client.is_connected:
+                raise BleakError(
+                    f"Powerpal {self.address} disconnected before service discovery finished"
+                )
+
+            try:
+                if client.services:
+                    return
+            except BleakError as err:
+                # Not resolved yet; fall through to an explicit discovery attempt.
+                last_error = err
+
+            get_services = getattr(client, "get_services", None)
+            if get_services is not None:
+                try:
+                    if await get_services():
+                        return
+                except Exception as err:  # noqa: BLE001 - bleak version dependent
+                    last_error = err
+
+            if time.monotonic() >= deadline:
+                raise BleakError(
+                    f"Service discovery did not complete for Powerpal {self.address}: {last_error}"
+                )
+            await asyncio.sleep(SERVICE_DISCOVERY_POLL)
+
+    async def _write_pairing_code(self, client: BleakClient) -> None:
+        """Send the Powerpal pairing code, bonding first only if the device demands it.
+
+        Powerpal authenticates at the application level, so OS-level bonding is not
+        normally needed. Pairing eagerly is harmful on BlueZ because it drops and
+        rebuilds the ATT link, invalidating service discovery.
+        """
+        try:
+            await client.write_gatt_char(
+                PAIRING_CODE_UUID, self._pairing_code_bytes(), response=False
+            )
+            return
+        except Exception as err:  # noqa: BLE001 - backend specific error types
+            if not _is_auth_error(err):
+                raise
+            _LOGGER.debug(
+                "Powerpal %s requires bonding before the pairing code write: %s",
+                self.address,
+                err,
+            )
+
+        if not await self._async_pair(client):
+            raise BleakError(
+                f"Powerpal {self.address} requires bonding but pairing is unsupported here"
+            )
+
+        # Pairing commonly resets the link, so re-check discovery before writing again.
+        await self._ensure_services_resolved(client)
+        await client.write_gatt_char(
+            PAIRING_CODE_UUID, self._pairing_code_bytes(), response=False
+        )
+
+    async def _async_pair(self, client: BleakClient) -> bool:
+        """Attempt OS-level BLE bonding. Return True if it appears to have worked."""
         pair = getattr(client, "pair", None)
         if pair is None:
-            return
+            return False
 
+        _LOGGER.info("Attempting OS-level pairing with Powerpal %s", self.address)
         try:
             await pair()
+            return True
         except TypeError:
             try:
                 await pair(2)
+                return True
             except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Bleak pair(2) failed; continuing: %s", err)
+                _LOGGER.debug("Bleak pair(2) failed: %s", err)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Bleak pairing failed or is unsupported; continuing: %s", err)
+            _LOGGER.debug("Bleak pairing failed or is unsupported: %s", err)
+        return False
 
     def _pairing_code_bytes(self) -> bytes:
         """Return the Powerpal pairing code as a little-endian uint32."""
