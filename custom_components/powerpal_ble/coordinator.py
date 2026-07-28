@@ -50,8 +50,7 @@ SERVICE_DISCOVERY_POLL = 0.5
 
 # BLE calls can block forever, which would wedge the reconnect loop silently.
 CONNECT_TIMEOUT = 120.0
-# Wide enough for the worst case of bonding plus both pairing-code write attempts.
-SETUP_TIMEOUT = 90.0
+SETUP_TIMEOUT = 60.0
 NOTIFY_TIMEOUT = 20.0
 
 # The device stalls the measurement CCCD write if it is issued straight after a
@@ -68,7 +67,6 @@ BATTERY_REFRESH_INTERVAL = 3600.0
 # Bail out before the 30s ATT transaction timeout: once that fires the stack is
 # obliged to close the ATT bearer, which takes the whole connection down with it.
 PAIRING_WRITE_TIMEOUT = 15.0
-BOND_TIMEOUT = 20.0
 
 
 @dataclass(frozen=True)
@@ -179,8 +177,13 @@ class PowerpalRuntime:
         self._stop_event = asyncio.Event()
         self._task = self._async_create_connection_task()
         _LOGGER.debug(
-            "Started Powerpal BLE connection loop for %s (%s connectable scanner(s))",
+            "Started Powerpal BLE connection loop for %s: pairing code %s (%s), "
+            "%s pulses/kWh, %s-minute interval, %s connectable scanner(s)",
             self.address,
+            self.pairing_code,
+            self._pairing_code_bytes().hex(),
+            self.pulses_per_kwh,
+            self.notification_interval,
             scanner_count,
         )
 
@@ -282,9 +285,11 @@ class PowerpalRuntime:
             raise RuntimeError(self._unreachable_message())
 
         _LOGGER.debug(
-            "Opening BLE connection to Powerpal %s (%s)",
+            "Opening BLE connection to Powerpal %s (%s) with pairing code %s (%s)",
             self.address,
             getattr(ble_device, "name", None) or "unnamed",
+            self.pairing_code,
+            self._pairing_code_bytes().hex(),
         )
         try:
             client = await asyncio.wait_for(
@@ -334,6 +339,7 @@ class PowerpalRuntime:
         """
         await self._ensure_services_resolved(client)
         _LOGGER.debug("Powerpal %s: services resolved", self.address)
+        self._log_gatt_profile(client)
 
         batch_size = await self._authenticate(client)
         _LOGGER.debug(
@@ -349,6 +355,34 @@ class PowerpalRuntime:
         # setup, so it runs out of band: it must never delay or abort the session.
         await self._start_battery_notifications(client)
         self._start_battery_poller(client)
+
+    def _log_gatt_profile(self, client: BleakClient) -> None:
+        """Dump the resolved GATT profile so protocol assumptions can be checked.
+
+        Which characteristics exist and what each one permits decides whether a
+        failure is a wrong pairing code, a firmware difference, or a stack problem;
+        without this the three are indistinguishable in the log.
+        """
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+
+        try:
+            for service in client.services:
+                _LOGGER.debug(
+                    "Powerpal %s service %s", self.address, service.uuid
+                )
+                for char in service.characteristics:
+                    _LOGGER.debug(
+                        "Powerpal %s   char %s handle=%s properties=%s",
+                        self.address,
+                        char.uuid,
+                        char.handle,
+                        char.properties,
+                    )
+        except Exception as err:  # noqa: BLE001 - diagnostics must never break setup
+            _LOGGER.debug(
+                "Could not dump the Powerpal %s GATT profile: %s", self.address, err
+            )
 
     async def _subscribe_to_measurements(self, client: BleakClient) -> None:
         """Enable measurement notifications, bounded and with diagnostics.
@@ -492,101 +526,43 @@ class PowerpalRuntime:
         has been accepted. Its value is returned so the caller can skip a redundant
         reconfiguration write.
 
-        Bonding must happen before any of this. Powerpal asks for BLE security on
-        connect and simply does not answer GATT on an unencrypted link: the write
-        gets no ATT response at all, and after 30 seconds the spec obliges the stack
-        to close the ATT bearer and drop the connection. The reference firmware
-        driver has the same ordering, writing the pairing code only once OS-level
-        authentication has completed.
+        The write is a Write Command, never a Write Request. Powerpal does not answer
+        a Write Request here: it stalls for the full 30s ATT transaction timeout, and
+        the spec then obliges the stack to close the ATT bearer, taking the whole
+        connection down with it.
+
+        Nothing escalates automatically when this fails. Both available escalations
+        are destructive on BlueZ -- a Write Request kills the link as above, and
+        OS-level bonding stores a bond that stops the adapter connecting at all if
+        the device will not honour it. Neither is recoverable without manual
+        intervention, so this reports what to try rather than trying it on every
+        single reconnect.
         """
-        await self._ensure_bonded(client)
-
-        # Bonding rebuilds the ATT link on BlueZ, which invalidates service discovery
-        # and can leave this client attached to a link that no longer exists.
-        if not client.is_connected:
-            raise BleakError(
-                f"Powerpal {self.address} dropped the link while bonding; the bond is "
-                "stored now, so the next attempt should connect encrypted"
-            )
-        await self._ensure_services_resolved(client)
-
-        try:
-            return await self._try_authenticate(client, response=True)
-        except Exception as err:  # noqa: BLE001 - backend specific error types
-            first_error = err
-            _LOGGER.debug(
-                "Powerpal %s did not answer a write request for pairing code %s: %s",
-                self.address,
-                self.pairing_code,
-                err,
-            )
-
-        # Some firmware only accepts the pairing code as a Write Command. That gives
-        # no ATT response, so the batch-size read is what actually confirms it.
-        if not client.is_connected:
-            raise BleakError(
-                f"Powerpal {self.address} dropped the link during authentication "
-                f"({first_error})"
-            )
-
-        try:
-            return await self._try_authenticate(client, response=False)
-        except Exception as err:  # noqa: BLE001 - backend specific error types
-            raise BleakError(
-                f"Powerpal {self.address} rejected pairing code {self.pairing_code} "
-                f"({err}); check the 6-digit code shown in the Powerpal app, and that "
-                "the phone app is not holding the only connection slot"
-            ) from err
-
-    async def _ensure_bonded(self, client: BleakClient) -> None:
-        """Bond with the device unless the adapter already holds a bond.
-
-        Failure is not fatal: some backends and remote proxies cannot bond at all,
-        and the authentication attempt below is a better test than guessing here.
-        """
-        pair = getattr(client, "pair", None)
-        if pair is None:
-            _LOGGER.debug(
-                "Powerpal %s: backend cannot bond, trying the pairing code unencrypted",
-                self.address,
-            )
-            return
-
-        try:
-            try:
-                await asyncio.wait_for(pair(), timeout=BOND_TIMEOUT)
-            except TypeError:
-                # Older Bleak signatures require an explicit protection level.
-                await asyncio.wait_for(pair(2), timeout=BOND_TIMEOUT)
-            _LOGGER.debug("Powerpal %s: link bonded", self.address)
-        except Exception as err:  # noqa: BLE001 - backend specific error types
-            if "already" in str(err).lower():
-                _LOGGER.debug("Powerpal %s: already bonded", self.address)
-                return
-            _LOGGER.debug(
-                "Powerpal %s: bonding failed (%s); trying the pairing code anyway",
-                self.address,
-                err,
-            )
-
-    async def _try_authenticate(
-        self, client: BleakClient, *, response: bool
-    ) -> int | None:
-        """Write the pairing code and read back a gated characteristic."""
         _LOGGER.debug(
-            "Powerpal %s: writing pairing code %s as %s (%s)",
+            "Powerpal %s: writing pairing code %s (%s)",
             self.address,
             self.pairing_code,
-            "write request" if response else "write command",
             self._pairing_code_bytes().hex(),
         )
         await asyncio.wait_for(
             client.write_gatt_char(
-                PAIRING_CODE_UUID, self._pairing_code_bytes(), response=response
+                PAIRING_CODE_UUID, self._pairing_code_bytes(), response=False
             ),
             timeout=PAIRING_WRITE_TIMEOUT,
         )
-        return await self._read_batch_size(client)
+
+        try:
+            return await self._read_batch_size(client)
+        except Exception as err:  # noqa: BLE001 - backend specific error types
+            raise BleakError(
+                f"Powerpal {self.address} did not accept pairing code "
+                f"{self.pairing_code} ({err}). Check the code in the Powerpal app "
+                "(6 digits, drop any leading zero) and that the phone app is not "
+                "holding the only connection slot. Do not try 'bluetoothctl pair': "
+                "this device rejects SMP pairing with AuthenticationFailed, and the "
+                "record it leaves behind stops the adapter connecting until it is "
+                f"cleared with 'bluetoothctl remove {self.address}'"
+            ) from err
 
     async def _read_batch_size(self, client: BleakClient) -> int | None:
         """Return the reading batch size the device is currently configured with."""
