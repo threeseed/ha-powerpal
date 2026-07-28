@@ -126,6 +126,7 @@ class PowerpalRuntime:
         self._disconnect_event: asyncio.Event | None = None
         self._client: BleakClient | None = None
         self._battery_task: asyncio.Task[None] | None = None
+        self._connected_at: float | None = None
 
         self._base_energy_kwh: float = 0.0
         self._total_pulses: int = 0
@@ -346,8 +347,6 @@ class PowerpalRuntime:
         bounds the whole sequence with a timeout.
         """
         await self._ensure_services_resolved(client)
-        _LOGGER.debug("Powerpal %s: services resolved", self.address)
-        self._log_gatt_profile(client)
 
         batch_size = await self._authenticate(client)
         _LOGGER.debug(
@@ -493,6 +492,12 @@ class PowerpalRuntime:
         await client.connect()
         return client
 
+    def _link_age(self) -> float:
+        """Return how long the current link has been up, in seconds."""
+        if self._connected_at is None:
+            return 0.0
+        return time.monotonic() - self._connected_at
+
     def _missing_characteristics(self, client: BleakClient) -> list[str]:
         """Return the characteristics this integration needs that are not present."""
         try:
@@ -527,15 +532,32 @@ class PowerpalRuntime:
         deadline = time.monotonic() + SERVICE_DISCOVERY_TIMEOUT
         last_error: Exception | None = None
         cache_cleared = False
+        first_pass = True
 
         while True:
             if not client.is_connected:
                 raise BleakError(
-                    f"Powerpal {self.address} disconnected before service discovery finished"
+                    f"Powerpal {self.address} disconnected before service discovery "
+                    f"finished (link lasted {self._link_age():.1f}s)"
                 )
 
             missing = self._missing_characteristics(client)
+            if first_pass:
+                # Logged before the first wait so a link that drops immediately still
+                # reveals whether anything at all was discovered.
+                first_pass = False
+                self._log_gatt_profile(client)
+                _LOGGER.debug(
+                    "Powerpal %s: waiting on %s characteristic(s): %s",
+                    self.address,
+                    len(missing),
+                    ", ".join(missing) or "none",
+                )
             if not missing:
+                _LOGGER.debug(
+                    "Powerpal %s: services resolved, all required characteristics present",
+                    self.address,
+                )
                 return
 
             if not cache_cleared and time.monotonic() >= deadline - (
@@ -794,6 +816,18 @@ class PowerpalRuntime:
     @callback
     def _handle_ble_disconnected(self) -> None:
         """Mark the client disconnected from the HA event loop."""
+        # How long the link survived separates the failure modes: a drop within a
+        # second or two is the peripheral refusing the session (another central
+        # holding the slot, or its own BLE state needing a power cycle), whereas a
+        # drop after minutes is ordinary range or interference.
+        if self._connected_at is not None:
+            _LOGGER.debug(
+                "Powerpal %s dropped the link after %.1fs",
+                self.address,
+                time.monotonic() - self._connected_at,
+            )
+        self._connected_at = None
+
         if self._disconnect_event is not None:
             self._disconnect_event.set()
         self._mark_disconnected(None)
@@ -907,6 +941,7 @@ class PowerpalRuntime:
     @callback
     def _mark_connected(self) -> None:
         """Mark BLE connected."""
+        self._connected_at = time.monotonic()
         self._async_set_data(
             PowerpalData(
                 **{
