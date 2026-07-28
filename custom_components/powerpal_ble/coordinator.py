@@ -172,9 +172,30 @@ class PowerpalRuntime:
             raise ConfigEntryNotReady("No connectable Bluetooth adapters are available")
 
         self._stop_event = asyncio.Event()
-        self._task = self.hass.async_create_task(
-            self._connection_loop(), name=f"Powerpal BLE {self.address}"
+        self._task = self._async_create_connection_task()
+
+    def _async_create_connection_task(self) -> asyncio.Task[None]:
+        """Create the connection loop as a background task.
+
+        The loop runs until the entry is unloaded, so it must not be a tracked task:
+        bootstrap waits on those before finishing startup and would time out on it.
+        """
+        coro = self._connection_loop()
+        name = f"Powerpal BLE {self.address}"
+
+        entry_background_task = getattr(
+            self.entry, "async_create_background_task", None
         )
+        if entry_background_task is not None:
+            return entry_background_task(self.hass, coro, name)
+
+        hass_background_task = getattr(
+            self.hass, "async_create_background_task", None
+        )
+        if hass_background_task is not None:
+            return hass_background_task(coro, name)
+
+        return self.hass.async_create_task(coro, name)
 
     async def async_stop(self) -> None:
         """Stop the background BLE connection task."""
