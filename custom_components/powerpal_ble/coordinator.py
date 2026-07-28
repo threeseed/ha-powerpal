@@ -173,6 +173,11 @@ class PowerpalRuntime:
 
         self._stop_event = asyncio.Event()
         self._task = self._async_create_connection_task()
+        _LOGGER.warning(
+            "Started Powerpal BLE connection loop for %s (%s connectable scanner(s))",
+            self.address,
+            scanner_count,
+        )
 
     def _async_create_connection_task(self) -> asyncio.Task[None]:
         """Create the connection loop as a background task.
@@ -267,10 +272,13 @@ class PowerpalRuntime:
             self.hass, self.address, connectable=True
         )
         if ble_device is None:
-            raise RuntimeError(
-                f"Powerpal {self.address} is not visible to a connectable Bluetooth adapter"
-            )
+            raise RuntimeError(self._unreachable_message())
 
+        _LOGGER.warning(
+            "Opening BLE connection to Powerpal %s (%s)",
+            self.address,
+            getattr(ble_device, "name", None) or "unnamed",
+        )
         client = await self._establish_client(ble_device)
         self._client = client
         self._mark_connected()
@@ -300,6 +308,34 @@ class PowerpalRuntime:
             await self._safe_disconnect(client)
             self._client = None
             self._mark_disconnected(None)
+
+    def _unreachable_message(self) -> str:
+        """Explain why no connectable BLEDevice is available for this address.
+
+        Being advertised is not enough: a passive-only scanner can see the device
+        without any adapter being able to open a connection to it.
+        """
+        last_service_info = getattr(bluetooth, "async_last_service_info", None)
+        if last_service_info is None:
+            return f"Powerpal {self.address} is not visible to a connectable Bluetooth adapter"
+
+        try:
+            passive = last_service_info(self.hass, self.address, connectable=False)
+        except Exception:  # noqa: BLE001 - diagnostics must never break the loop
+            passive = None
+
+        if passive is not None:
+            return (
+                f"Powerpal {self.address} is advertising (RSSI "
+                f"{getattr(passive, 'rssi', 'unknown')}, via "
+                f"{getattr(passive, 'source', 'unknown')}) but no connectable adapter "
+                "or proxy can reach it; the scanner seeing it is passive-only or out of range"
+            )
+
+        return (
+            f"Powerpal {self.address} has not been seen by any Bluetooth scanner; "
+            "check the configured MAC address"
+        )
 
     async def _establish_client(self, ble_device: Any) -> BleakClient:
         """Open a Bleak connection using HA's BLEDevice object."""
