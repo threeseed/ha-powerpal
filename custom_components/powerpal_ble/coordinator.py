@@ -53,8 +53,16 @@ CONNECT_TIMEOUT = 120.0
 SETUP_TIMEOUT = 60.0
 NOTIFY_TIMEOUT = 20.0
 
-BATTERY_READ_ATTEMPTS = 3
-BATTERY_READ_RETRY_DELAY = 2.0
+# The device stalls the measurement CCCD write if it is issued straight after a
+# batch-size change, so give the link a moment to settle first.
+SUBSCRIBE_SETTLE_DELAY = 2.0
+
+# Powerpal rejects reads while it is still digesting the setup writes, so the first
+# battery read waits well clear of them and later ones back off instead of hammering.
+BATTERY_READ_TIMEOUT = 15.0
+BATTERY_FIRST_READ_DELAY = 15.0
+BATTERY_RETRY_DELAYS = (30.0, 60.0, 300.0, 900.0)
+BATTERY_REFRESH_INTERVAL = 3600.0
 
 # Errors that mean the peripheral wants OS-level bonding before it will accept a write.
 AUTH_ERROR_MARKERS = (
@@ -123,6 +131,7 @@ class PowerpalRuntime:
         self._stop_event: asyncio.Event | None = None
         self._disconnect_event: asyncio.Event | None = None
         self._client: BleakClient | None = None
+        self._battery_task: asyncio.Task[None] | None = None
 
         self._base_energy_kwh: float = 0.0
         self._total_pulses: int = 0
@@ -214,6 +223,8 @@ class PowerpalRuntime:
         """Stop the background BLE connection task."""
         if self._stop_event is not None:
             self._stop_event.set()
+
+        self._cancel_battery_poller()
 
         if self._task is not None:
             self._task.cancel()
@@ -322,6 +333,7 @@ class PowerpalRuntime:
 
             await self._wait_for_disconnect_or_stop()
         finally:
+            self._cancel_battery_poller()
             await self._safe_disconnect(client)
             self._client = None
             self._mark_disconnected(None)
@@ -335,25 +347,20 @@ class PowerpalRuntime:
         await self._ensure_services_resolved(client)
         _LOGGER.debug("Powerpal %s: services resolved", self.address)
 
-        await self._write_pairing_code(client)
-        _LOGGER.debug("Powerpal %s: pairing code written", self.address)
-
-        await asyncio.sleep(0.5)
-        await client.write_gatt_char(
-            READING_BATCH_SIZE_UUID,
-            int(self.notification_interval).to_bytes(4, byteorder="little"),
-            response=False,
+        batch_size = await self._authenticate(client)
+        _LOGGER.debug(
+            "Powerpal %s: authenticated (device batch size %s)", self.address, batch_size
         )
-        _LOGGER.debug("Powerpal %s: reading batch size written", self.address)
 
-        # Order matters: subscribing immediately after the batch-size write makes the
-        # device stall the CCCD write. The battery steps double as settle time.
-        await self._read_battery(client)
-        await self._start_battery_notifications(client)
-        _LOGGER.debug("Powerpal %s: battery handled", self.address)
+        await self._configure_batch_size(client, batch_size)
 
         await self._subscribe_to_measurements(client)
         _LOGGER.debug("Powerpal %s: subscribed to measurements", self.address)
+
+        # Battery is optional and the device answers reads erratically right after
+        # setup, so it runs out of band: it must never delay or abort the session.
+        await self._start_battery_notifications(client)
+        self._start_battery_poller(client)
 
     async def _subscribe_to_measurements(self, client: BleakClient) -> None:
         """Enable measurement notifications, bounded and with diagnostics.
@@ -487,37 +494,101 @@ class PowerpalRuntime:
                 )
             await asyncio.sleep(SERVICE_DISCOVERY_POLL)
 
-    async def _write_pairing_code(self, client: BleakClient) -> None:
-        """Send the Powerpal pairing code, bonding first only if the device demands it.
+    async def _authenticate(self, client: BleakClient) -> int | None:
+        """Write the pairing code and prove the session is authenticated.
 
-        Powerpal authenticates at the application level, so OS-level bonding is not
-        normally needed. Pairing eagerly is harmful on BlueZ because it drops and
-        rebuilds the ATT link, invalidating service discovery.
+        Powerpal gates every characteristic in its service behind the pairing code
+        and answers an unauthenticated session with generic ATT errors rather than a
+        clean rejection, so the write alone proves nothing. Reading the reading
+        batch size back is the confirmation: that read cannot succeed until the code
+        has been accepted. Its value is returned so the caller can skip a redundant
+        reconfiguration write.
+
+        The write must be a Write Request. A Write Command carries no ATT response,
+        so a rejected pairing code looks identical to an accepted one and the
+        bonding fallback below can never be reached.
         """
         try:
-            await client.write_gatt_char(
-                PAIRING_CODE_UUID, self._pairing_code_bytes(), response=False
-            )
-            return
+            return await self._try_authenticate(client)
         except Exception as err:  # noqa: BLE001 - backend specific error types
-            if not _is_auth_error(err):
-                raise
+            first_error = err
             _LOGGER.debug(
-                "Powerpal %s requires bonding before the pairing code write: %s",
+                "Powerpal %s did not accept the pairing code without bonding%s: %s",
                 self.address,
+                " (device wants OS-level bonding)" if _is_auth_error(err) else "",
                 err,
             )
 
+        # Powerpal requests BLE security on connect, so bond and try once more.
+        # Bonding is not done up front because on BlueZ it tears down and rebuilds
+        # the ATT link, invalidating service discovery.
         if not await self._async_pair(client):
             raise BleakError(
-                f"Powerpal {self.address} requires bonding but pairing is unsupported here"
+                f"Powerpal {self.address} did not accept the pairing code and "
+                f"OS-level bonding is unavailable here: {first_error}"
             )
 
-        # Pairing commonly resets the link, so re-check discovery before writing again.
+        # Pairing commonly resets the link, so re-check discovery before retrying.
         await self._ensure_services_resolved(client)
+        try:
+            return await self._try_authenticate(client)
+        except Exception as err:  # noqa: BLE001 - backend specific error types
+            raise BleakError(
+                f"Powerpal {self.address} rejected the pairing code even after "
+                f"bonding ({err}); check the 6-digit code shown in the Powerpal app"
+            ) from err
+
+    async def _try_authenticate(self, client: BleakClient) -> int | None:
+        """Write the pairing code and read back a gated characteristic."""
         await client.write_gatt_char(
-            PAIRING_CODE_UUID, self._pairing_code_bytes(), response=False
+            PAIRING_CODE_UUID, self._pairing_code_bytes(), response=True
         )
+        _LOGGER.debug("Powerpal %s: pairing code accepted", self.address)
+        return await self._read_batch_size(client)
+
+    async def _read_batch_size(self, client: BleakClient) -> int | None:
+        """Return the reading batch size the device is currently configured with."""
+        raw = bytes(await client.read_gatt_char(READING_BATCH_SIZE_UUID))
+        if len(raw) != 4:
+            _LOGGER.debug(
+                "Powerpal %s returned an unexpected batch size payload: %s",
+                self.address,
+                raw.hex(),
+            )
+            return None
+        return int.from_bytes(raw, byteorder="little")
+
+    async def _configure_batch_size(
+        self, client: BleakClient, current: int | None
+    ) -> None:
+        """Set the measurement interval, but only when it actually differs.
+
+        Lowering the batch size makes Powerpal replay every reading it buffered
+        under the previous interval, which the stale filter then discards. Skipping
+        the write when the device is already configured avoids that burst on every
+        reconnect.
+        """
+        if current == self.notification_interval:
+            _LOGGER.debug(
+                "Powerpal %s: batch size already %s, leaving it alone",
+                self.address,
+                current,
+            )
+            return
+
+        await client.write_gatt_char(
+            READING_BATCH_SIZE_UUID,
+            int(self.notification_interval).to_bytes(4, byteorder="little"),
+            response=True,
+        )
+        _LOGGER.debug(
+            "Powerpal %s: batch size changed from %s to %s",
+            self.address,
+            current,
+            self.notification_interval,
+        )
+        # The device needs a moment before it will answer the measurement CCCD write.
+        await asyncio.sleep(SUBSCRIBE_SETTLE_DELAY)
 
     async def _async_pair(self, client: BleakClient) -> bool:
         """Attempt OS-level BLE bonding. Return True if it appears to have worked."""
@@ -543,36 +614,87 @@ class PowerpalRuntime:
         """Return the Powerpal pairing code as a little-endian uint32."""
         return int(self.pairing_code).to_bytes(4, byteorder="little")
 
-    async def _read_battery(self, client: BleakClient) -> None:
-        """Read battery level if available.
-
-        Powerpal often answers the first read with a generic ATT error while it is
-        still busy with the pairing/batch-size writes, so retry a few times. The
-        battery is optional: failing here must never abort the session, and
-        notifications can still deliver a value later.
-        """
-        for attempt in range(1, BATTERY_READ_ATTEMPTS + 1):
-            if not client.is_connected:
-                return
-            try:
-                battery = bytes(await client.read_gatt_char(BATTERY_UUID))
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug(
-                    "Could not read Powerpal battery level (attempt %s/%s): %s",
-                    attempt,
-                    BATTERY_READ_ATTEMPTS,
-                    err,
+    async def _read_battery(self, client: BleakClient) -> bool:
+        """Read the battery level once. Return True if a value was decoded."""
+        if not client.is_connected:
+            return False
+        try:
+            battery = bytes(
+                await asyncio.wait_for(
+                    client.read_gatt_char(BATTERY_UUID), timeout=BATTERY_READ_TIMEOUT
                 )
-                if attempt < BATTERY_READ_ATTEMPTS:
-                    await asyncio.sleep(BATTERY_READ_RETRY_DELAY)
-                continue
-            self._process_battery(battery)
-            return
+            )
+        except Exception as err:  # noqa: BLE001 - battery is best effort
+            _LOGGER.debug(
+                "Could not read Powerpal %s battery level: %s", self.address, err
+            )
+            return False
+
+        if not self._process_battery(battery):
+            _LOGGER.debug(
+                "Powerpal %s returned an unusable battery payload: %s",
+                self.address,
+                battery.hex(),
+            )
+            return False
 
         _LOGGER.debug(
-            "Giving up on the Powerpal %s battery read; relying on notifications",
-            self.address,
+            "Powerpal %s battery level: %s%%", self.address, self.data.battery_percent
         )
+        return True
+
+    def _start_battery_poller(self, client: BleakClient) -> None:
+        """Run the battery read in the background for the life of the connection."""
+        self._cancel_battery_poller()
+        self._battery_task = asyncio.create_task(
+            self._battery_poll_loop(client), name=f"Powerpal BLE battery {self.address}"
+        )
+
+    def _cancel_battery_poller(self) -> None:
+        """Stop the background battery poller, if one is running."""
+        task = self._battery_task
+        self._battery_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _battery_poll_loop(self, client: BleakClient) -> None:
+        """Keep retrying the battery read, then refresh it periodically.
+
+        Powerpal answers reads with a generic ATT error while it is still busy with
+        the setup writes, and it never notifies 0x2A19 on its own, so a one-shot read
+        during setup leaves the battery unknown for the whole session. Retrying out
+        of band recovers from that and keeps the value fresh on long connections.
+        """
+        delay = BATTERY_FIRST_READ_DELAY
+        failures = 0
+
+        try:
+            while True:
+                await asyncio.sleep(delay)
+                if not client.is_connected:
+                    return
+
+                if await self._read_battery(client):
+                    failures = 0
+                    delay = BATTERY_REFRESH_INTERVAL
+                    continue
+
+                delay = BATTERY_RETRY_DELAYS[
+                    min(failures, len(BATTERY_RETRY_DELAYS) - 1)
+                ]
+                failures += 1
+                _LOGGER.debug(
+                    "Powerpal %s battery read failed (%s in a row); retrying in %.0fs",
+                    self.address,
+                    failures,
+                    delay,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - never let this kill the session
+            _LOGGER.debug(
+                "Powerpal %s battery poller stopped: %s", self.address, err
+            )
 
     async def _start_battery_notifications(self, client: BleakClient) -> None:
         """Subscribe to battery notifications if available."""
@@ -623,6 +745,8 @@ class PowerpalRuntime:
     @callback
     def _process_measurement(self, data: bytes) -> None:
         """Decode a Powerpal measurement notification."""
+        _LOGGER.debug("Powerpal %s measurement: %s", self.address, data.hex())
+
         if len(data) < 6:
             _LOGGER.debug("Ignoring short Powerpal measurement: %s", data.hex())
             return
@@ -631,6 +755,11 @@ class PowerpalRuntime:
         pulses = int.from_bytes(data[4:6], byteorder="little")
         measurement_key = (unix_time, pulses)
         if measurement_key in self._seen_measurements:
+            _LOGGER.debug(
+                "Ignoring duplicate Powerpal measurement timestamp=%s pulses=%s",
+                unix_time,
+                pulses,
+            )
             return
         self._remember_measurement(measurement_key)
 
@@ -642,8 +771,11 @@ class PowerpalRuntime:
             )
             if unix_time < now - stale_limit or unix_time > now + 60:
                 _LOGGER.debug(
-                    "Dropping stale Powerpal measurement timestamp=%s pulses=%s data=%s",
+                    "Dropping stale Powerpal measurement timestamp=%s (%.0fs behind "
+                    "this host, limit %ss) pulses=%s data=%s",
                     unix_time,
+                    now - unix_time,
+                    stale_limit,
                     pulses,
                     data.hex(),
                 )
@@ -699,13 +831,13 @@ class PowerpalRuntime:
         self._seen_measurements.add(measurement_key)
 
     @callback
-    def _process_battery(self, data: bytes) -> None:
-        """Decode a battery update."""
+    def _process_battery(self, data: bytes) -> bool:
+        """Decode a battery update. Return True if a valid level was stored."""
         if not data:
-            return
+            return False
         battery = int(data[0])
         if not 0 <= battery <= 100:
-            return
+            return False
         self._async_set_data(
             PowerpalData(
                 **{
@@ -714,6 +846,7 @@ class PowerpalRuntime:
                 }
             )
         )
+        return True
 
     @callback
     def _mark_connected(self) -> None:
