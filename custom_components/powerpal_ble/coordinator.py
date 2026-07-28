@@ -51,6 +51,7 @@ SERVICE_DISCOVERY_POLL = 0.5
 # BLE calls can block forever, which would wedge the reconnect loop silently.
 CONNECT_TIMEOUT = 120.0
 SETUP_TIMEOUT = 60.0
+NOTIFY_TIMEOUT = 20.0
 
 # Errors that mean the peripheral wants OS-level bonding before it will accept a write.
 AUTH_ERROR_MARKERS = (
@@ -346,8 +347,47 @@ class PowerpalRuntime:
         await self._start_battery_notifications(client)
         _LOGGER.warning("Powerpal %s: battery handled", self.address)
 
-        await client.start_notify(MEASUREMENT_UUID, self._notification_callback)
+        await self._subscribe_to_measurements(client)
         _LOGGER.warning("Powerpal %s: subscribed to measurements", self.address)
+
+    async def _subscribe_to_measurements(self, client: BleakClient) -> None:
+        """Enable measurement notifications, bounded and with diagnostics.
+
+        A blocking start_notify usually means one of two things: the peripheral
+        already dropped the link (so the CCCD write is never answered), or the
+        descriptor needs an encrypted link and the stack is silently waiting on
+        bonding. The logging below distinguishes them.
+        """
+        characteristic = None
+        try:
+            characteristic = client.services.get_characteristic(MEASUREMENT_UUID)
+        except Exception as err:  # noqa: BLE001 - diagnostics only
+            _LOGGER.debug("Could not inspect measurement characteristic: %s", err)
+
+        _LOGGER.warning(
+            "Powerpal %s: subscribing to measurements (connected=%s, properties=%s)",
+            self.address,
+            client.is_connected,
+            getattr(characteristic, "properties", "unknown"),
+        )
+
+        if not client.is_connected:
+            raise BleakError(
+                f"Powerpal {self.address} dropped the link before the measurement "
+                "subscription; the pairing code may have been rejected"
+            )
+
+        try:
+            await asyncio.wait_for(
+                client.start_notify(MEASUREMENT_UUID, self._notification_callback),
+                timeout=NOTIFY_TIMEOUT,
+            )
+        except (asyncio.TimeoutError, TimeoutError) as err:
+            raise RuntimeError(
+                f"Timed out after {NOTIFY_TIMEOUT:.0f}s subscribing to Powerpal "
+                f"{self.address} measurements (connected={client.is_connected}); the "
+                "device either dropped the link or requires OS-level bonding"
+            ) from err
 
     def _unreachable_message(self) -> str:
         """Explain why no connectable BLEDevice is available for this address.
